@@ -1,0 +1,668 @@
+--- /home/aravind-arepally/xv6-fresh/kernel/proc.c	2026-10-12 23:20:18.424267384 +0530
++++ kernel/proc.c	2026-10-12 21:54:36.442756619 +0530
+@@ -16,7 +16,8 @@
+ struct spinlock pid_lock;
+ 
+ extern void forkret(void);
+-static void freeproc(struct proc *p);
++void
++freeproc(struct proc *p);
+ 
+ extern char trampoline[]; // trampoline.S
+ 
+@@ -106,7 +107,7 @@
+ // If found, initialize state required to run in the kernel,
+ // and return with p->lock held.
+ // If there are no free procs, or a memory allocation fails, return 0.
+-static struct proc *
++struct proc*
+ allocproc(void)
+ {
+   struct proc *p;
+@@ -124,6 +125,8 @@
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->priority = 10;
++  p->wait_ticks = 0;
+ 
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+@@ -152,14 +155,14 @@
+ // free a proc structure and the data hanging from it,
+ // including user pages.
+ // p->lock must be held.
+-static void
++void
+ freeproc(struct proc *p)
+ {
+   if (p->trapframe)
+-    kfree((void *)p->trapframe);
++  if(p->trapframe && !p->is_thread)
++    if(!p->is_thread) if(!p->is_thread) if(!p->is_thread) kfree((void*)p->trapframe);
+   p->trapframe = 0;
+-  if (p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++  if(p->pagetable && !p->is_thread) proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -413,7 +416,7 @@
+     // Wait for a child to exit.
+     sleep_prepare(p); //DOC: wait-sleep
+     release(&wait_lock);
+-    sleep();
++    sleep(p, &p->lock);
+     acquire(&wait_lock);
+   }
+ }
+@@ -425,49 +428,6 @@
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
+-void
+-scheduler(void)
+-{
+-  struct proc *p;
+-  struct cpu *c = mycpu();
+-
+-  c->proc = 0;
+-  for (;;) {
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+-    intr_on();
+-    intr_off();
+-
+-    int found = 0;
+-    for (p = proc; p < &proc[NPROC]; p++) {
+-      acquire(&p->lock);
+-      if (p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Don't re-enable interrupts on release.
+-        mycpu()->intena = 0;
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
+-      }
+-      release(&p->lock);
+-    }
+-    if (found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
+-      asm volatile("wfi");
+-    }
+-  }
+-}
+ 
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+@@ -559,7 +519,7 @@
+ // If the channel registered by sleep_prepare() has been woken up in
+ // the meantime, do not go to sleep, and instead return immediately.
+ void
+-sleep(void)
++sleep(void *chan, struct spinlock *lk)
+ {
+   struct proc *p = myproc();
+ 
+@@ -701,3 +661,66 @@
+     printk("\n");
+   }
+ }
++
++
++
++
++
++
++
++
++
++void
++scheduler(void)
++{
++  struct proc *p;
++  struct cpu *c = mycpu();
++  c->proc = 0;
++
++  for(;;){
++    intr_on();
++    struct proc *best = 0;
++    struct proc *ran = 0;
++
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE) {
++        if(p->wait_ticks > 30 && p->priority > 1) {
++          p->priority--;
++          p->wait_ticks = 0;
++        }
++        if(best == 0 || p->priority < best->priority ||
++           (p->priority == best->priority && p->wait_ticks > best->wait_ticks)) {
++          if(best != 0) release(&best->lock);
++          best = p;
++          p->wait_ticks = 0;
++        } else {
++          release(&p->lock);
++        }
++      } else {
++        release(&p->lock);
++      }
++    }
++
++    if(best != 0) {
++      // Threads share a page table, so TRAPFRAME must point to the
++      // incoming process's own trapframe page. Refresh it each switch.
++      uvmunmap(best->pagetable, TRAPFRAME, 1, 0);
++      mappages(best->pagetable, TRAPFRAME, PGSIZE, (uint64)best->trapframe, PTE_R | PTE_W);
++      sfence_vma();
++
++      best->state = RUNNING;
++      c->proc = best;
++      ran = best;
++      swtch(&c->context, &best->context);
++      c->proc = 0;
++      release(&best->lock);
++    }
++
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE && p != ran) p->wait_ticks++;
++      release(&p->lock);
++    }
++  }
++}
+--- /home/aravind-arepally/xv6-fresh/kernel/proc.h	2026-10-12 23:20:18.424267384 +0530
++++ kernel/proc.h	2026-10-06 23:59:01.480351525 +0530
+@@ -1,9 +1,14 @@
++#ifndef KERNEL_PROC_H
++#define KERNEL_PROC_H
++
++#include "types.h"
++#include "riscv.h"
++#include "param.h"
++
+ // Saved registers for kernel context switches.
+ struct context {
+   uint64 ra;
+   uint64 sp;
+-
+-  // callee-saved
+   uint64 s0;
+   uint64 s1;
+   uint64 s2;
+@@ -20,60 +25,52 @@
+ 
+ // Per-CPU state.
+ struct cpu {
+-  struct proc *proc;      // The process running on this cpu, or null.
+-  struct context context; // swtch() here to enter scheduler().
+-  int noff;               // Depth of push_off() nesting.
+-  int intena;             // Were interrupts enabled before push_off()?
++  struct proc *proc;          // The process running on this cpu, or null.
++  struct context context;     // swtch() here to enter scheduler().
++  int noff;                   // Depth of push_off() nesting.
++  int intena;                 // Were interrupts enabled before push_off()?
+ };
+ 
+ extern struct cpu cpus[NCPU];
+ 
+ // per-process data for the trap handling code in trampoline.S.
+-// sits in a page by itself just under the trampoline page in the
+-// user page table. not specially mapped in the kernel page table.
+-// uservec in trampoline.S saves user registers in the trapframe,
+-// then initializes registers from the trapframe's
+-// kernel_sp, kernel_hartid, kernel_satp, and jumps to kernel_trap.
+-// prepare_return() and userret in trampoline.S set up
+-// the trapframe's kernel_*, restore user registers from the
+-// trapframe, switch to the user page table, and enter user space.
+ struct trapframe {
+-  /*   0 */ uint64 kernel_satp;   // kernel page table
+-  /*   8 */ uint64 kernel_sp;     // top of process's kernel stack
+-  /*  16 */ uint64 kernel_trap;   // usertrap()
+-  /*  24 */ uint64 epc;           // saved user program counter
+-  /*  32 */ uint64 kernel_hartid; // saved kernel tp
+-  /*  40 */ uint64 ra;
+-  /*  48 */ uint64 sp;
+-  /*  56 */ uint64 gp;
+-  /*  64 */ uint64 tp;
+-  /*  72 */ uint64 t0;
+-  /*  80 */ uint64 t1;
+-  /*  88 */ uint64 t2;
+-  /*  96 */ uint64 s0;
+-  /* 104 */ uint64 s1;
+-  /* 112 */ uint64 a0;
+-  /* 120 */ uint64 a1;
+-  /* 128 */ uint64 a2;
+-  /* 136 */ uint64 a3;
+-  /* 144 */ uint64 a4;
+-  /* 152 */ uint64 a5;
+-  /* 160 */ uint64 a6;
+-  /* 168 */ uint64 a7;
+-  /* 176 */ uint64 s2;
+-  /* 184 */ uint64 s3;
+-  /* 192 */ uint64 s4;
+-  /* 200 */ uint64 s5;
+-  /* 208 */ uint64 s6;
+-  /* 216 */ uint64 s7;
+-  /* 224 */ uint64 s8;
+-  /* 232 */ uint64 s9;
+-  /* 240 */ uint64 s10;
+-  /* 248 */ uint64 s11;
+-  /* 256 */ uint64 t3;
+-  /* 264 */ uint64 t4;
+-  /* 272 */ uint64 t5;
+-  /* 280 */ uint64 t6;
++  uint64 kernel_satp;   // kernel page table
++  uint64 kernel_sp;     // top of process's kernel stack
++  uint64 kernel_trap;   // usertrap()
++  uint64 epc;           // saved user program counter
++  uint64 kernel_hartid; // saved kernel tp
++  uint64 ra;
++  uint64 sp;
++  uint64 gp;
++  uint64 tp;
++  uint64 t0;
++  uint64 t1;
++  uint64 t2;
++  uint64 s0;
++  uint64 s1;
++  uint64 a0;
++  uint64 a1;
++  uint64 a2;
++  uint64 a3;
++  uint64 a4;
++  uint64 a5;
++  uint64 a6;
++  uint64 a7;
++  uint64 s2;
++  uint64 s3;
++  uint64 s4;
++  uint64 s5;
++  uint64 s6;
++  uint64 s7;
++  uint64 s8;
++  uint64 s9;
++  uint64 s10;
++  uint64 s11;
++  uint64 t3;
++  uint64 t4;
++  uint64 t5;
++  uint64 t6;
+ };
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+@@ -83,14 +80,14 @@
+   struct spinlock lock;
+ 
+   // p->lock must be held when using these:
+-  enum procstate state; // Process state
+-  void *chan;           // If non-zero, sleeping on chan
+-  int killed;           // If non-zero, have been killed
+-  int xstate;           // Exit status to be returned to parent's wait
+-  int pid;              // Process ID
++  enum procstate state;        // Process state
++  void *chan;                  // If non-zero, sleeping on chan
++  int killed;                  // If non-zero, have been killed
++  int xstate;                  // Exit status to be returned to parent's wait
++  int pid;                     // Process ID
+ 
+   // wait_lock must be held when using this:
+-  struct proc *parent; // Parent process
++  struct proc *parent;         // Parent process
+ 
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+@@ -101,4 +98,19 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // Assignment 7 additions
++  int is_thread;
++  struct proc *parent_thread;
++  int priority;
++  int wait_ticks;
++  int burst_time;
++  int remaining_time;
+ };
++
++extern struct proc proc[NPROC];
++
++#endif
++
++struct proc* allocproc(void);
++void freeproc(struct proc*);
+--- /home/aravind-arepally/xv6-fresh/kernel/sysproc.c	2026-10-12 23:20:18.425267375 +0530
++++ kernel/sysproc.c	2026-10-12 22:03:53.799803253 +0530
+@@ -82,7 +82,7 @@
+     }
+     sleep_prepare(&ticks);
+     release(&tickslock);
+-    sleep();
++    sleep(myproc(), &myproc()->lock);
+     acquire(&tickslock);
+   }
+   release(&tickslock);
+@@ -110,3 +110,177 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++// === Assignment 7: Semaphores ===
++#define MAX_SEMS 10
++struct semaphore_def { int value; int used; };
++struct semaphore_def kernel_sems[MAX_SEMS];
++struct spinlock sem_lock;
++int sems_initialized = 0;
++
++uint64
++sys_sem_init(void)
++{
++  int id, val;
++  if(argint(0, &id) < 0 || argint(1, &val) < 0) return -1;
++  if(id < 0 || id >= MAX_SEMS) return -1;
++  if(!sems_initialized) {
++    initlock(&sem_lock, "sem_lock");
++    for(int i=0; i<MAX_SEMS; i++) kernel_sems[i].used = 0;
++    sems_initialized = 1;
++  }
++  acquire(&sem_lock);
++  kernel_sems[id].value = val;
++  kernel_sems[id].used = 1;
++  release(&sem_lock);
++  return id;
++}
++
++uint64
++sys_sem_wait(void)
++{
++  int id;
++  if(argint(0, &id) < 0) return -1;
++  if(id < 0 || id >= MAX_SEMS) return -1;
++  acquire(&sem_lock);
++  if(!kernel_sems[id].used){
++    release(&sem_lock);
++    return -1;
++  }
++  while(kernel_sems[id].value <= 0){
++    release(&sem_lock);
++    yield();
++    acquire(&sem_lock);
++  }
++  kernel_sems[id].value--;
++  release(&sem_lock);
++  return 0;
++}
++
++uint64
++sys_sem_signal(void)
++{
++  int id;
++  if(argint(0, &id) < 0) return -1;
++  if(id < 0 || id >= MAX_SEMS) return -1;
++  acquire(&sem_lock);
++  if(!kernel_sems[id].used){
++    release(&sem_lock);
++    return -1;
++  }
++  kernel_sems[id].value++;
++  wakeup(&kernel_sems[id]);
++  release(&sem_lock);
++  return 0;
++}
++
++// === Assignment 7: Priority ===
++uint64
++sys_set_priority(void)
++{
++  int pid, new_priority;
++  if(argint(0, &pid) < 0 || argint(1, &new_priority) < 0) return -1;
++  struct proc *p;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->pid == pid && p->state != UNUSED) {
++      p->priority = new_priority;
++      p->wait_ticks = 0;
++      release(&p->lock);
++      return 0;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
++uint64
++sys_get_priority(void)
++{
++  int pid;
++  if(argint(0, &pid) < 0) return -1;
++  struct proc *p;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->pid == pid && p->state != UNUSED) {
++      int pr = p->priority;
++      release(&p->lock);
++      return pr;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
++// === Assignment 7: Clone & Join ===
++uint64
++sys_clone(void)
++{
++  uint64 fcn, arg, stack;
++  struct proc *np;
++
++  if(argaddr(0, &fcn) < 0 || argaddr(1, &arg) < 0 || argaddr(2, &stack) < 0)
++    return -1;
++
++  np = allocproc();
++  if(np == 0)
++    return -1;
++
++  // Threads share the parent's address space
++  np->pagetable = myproc()->pagetable;
++  np->sz = myproc()->sz;
++  np->is_thread = 1;
++  np->parent_thread = myproc();
++  np->priority = 10;
++
++  // Copy parent trapframe (keeps kernel_* fields), then redirect to fcn
++  *np->trapframe = *myproc()->trapframe;
++  np->trapframe->epc = fcn;
++  np->trapframe->sp = stack;
++  np->trapframe->a0 = arg;
++  np->trapframe->ra = 0;   // if fcn returns, fault -> clean exit
++
++  for(int i = 0; i < NOFILE; i++)
++    if(myproc()->ofile[i])
++      np->ofile[i] = filedup(myproc()->ofile[i]);
++  np->cwd = idup(myproc()->cwd);
++  safestrcpy(np->name, myproc()->name, sizeof(np->name));
++
++  np->state = RUNNABLE;
++  release(&np->lock);
++  return np->pid;
++}
++
++uint64
++sys_join(void)
++{
++  int pid;
++  struct proc *p, *np;
++
++  if(argint(0, &pid) < 0)
++    return -1;
++
++  p = myproc();
++
++  for(;;){
++    int found = 0;
++    for(np = proc; np < &proc[NPROC]; np++){
++      acquire(&np->lock);
++      if(np->parent_thread == p && np->pid == pid){
++        if(np->state == ZOMBIE){
++          uint64 xstate = np->xstate;
++          freeproc(np);
++          release(&np->lock);
++          return xstate;
++        }
++        found = 1;
++        release(&np->lock);
++        break;
++      }
++      release(&np->lock);
++    }
++    if(!found)
++      return -1;
++    yield();
++  }
++}
+--- /home/aravind-arepally/xv6-fresh/kernel/syscall.c	2026-10-12 23:20:18.425267375 +0530
++++ kernel/syscall.c	2026-10-06 23:23:44.840412422 +0530
+@@ -7,6 +7,14 @@
+ #include "syscall.h"
+ #include "defs.h"
+ 
++extern uint64 sys_get_priority(void);
++extern uint64 sys_set_priority(void);
++extern uint64 sys_sem_signal(void);
++extern uint64 sys_sem_wait(void);
++extern uint64 sys_sem_init(void);
++extern uint64 sys_join(void);
++extern uint64 sys_clone(void);
++
+ // Fetch the uint64 at addr from the current process.
+ int
+ fetchaddr(uint64 addr, uint64 *ip)
+@@ -54,19 +62,21 @@
+ }
+ 
+ // Fetch the nth 32-bit system call argument.
+-void
++int
+ argint(int n, int *ip)
+ {
+   *ip = argraw(n);
++  return 0;
+ }
+ 
+ // Retrieve an argument as a pointer.
+ // Doesn't check for legality, since
+ // copyin/copyout will do that.
+-void
++int
+ argaddr(int n, uint64 *ip)
+ {
+   *ip = argraw(n);
++  return 0;
+ }
+ 
+ // Fetch the nth word-sized system call argument as a null-terminated string.
+@@ -131,6 +141,13 @@
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
+   // clang-format on
++[SYS_clone] sys_clone,
++[SYS_join] sys_join,
++[SYS_sem_init] sys_sem_init,
++[SYS_sem_wait] sys_sem_wait,
++[SYS_sem_signal] sys_sem_signal,
++[SYS_set_priority] sys_set_priority,
++[SYS_get_priority] sys_get_priority,
+ };
+ 
+ void
+@@ -149,3 +166,7 @@
+     p->trapframe->a0 = -1;
+   }
+ }
++extern uint64 sys_sem_wait(void);
++extern uint64 sys_sem_signal(void);
++extern uint64 sys_set_priority(void);
++extern uint64 sys_get_priority(void);
+--- /home/aravind-arepally/xv6-fresh/kernel/syscall.h	2026-10-12 23:20:18.425267375 +0530
++++ kernel/syscall.h	2026-10-06 23:11:47.586510492 +0530
+@@ -21,3 +21,10 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_clone 24
++#define SYS_join 25
++#define SYS_sem_init 26
++#define SYS_sem_wait 27
++#define SYS_sem_signal 28
++#define SYS_set_priority 29
++#define SYS_get_priority 30
+--- /home/aravind-arepally/xv6-fresh/Makefile	2026-10-12 23:20:18.421698634 +0530
++++ Makefile	2026-10-12 22:10:04.497209548 +0530
+@@ -60,11 +60,7 @@
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ 
+-# Deterministic builds.
+-DETFLAGS = -ffile-prefix-map=$(CURDIR)=.
+-
+ CFLAGS = -Wall -Werror -Wno-unknown-attributes -O -fno-omit-frame-pointer -ggdb -gdwarf-2
+-CFLAGS += $(DETFLAGS)
+ CFLAGS += -march=rv64gc
+ CFLAGS += -std=gnu99
+ CFLAGS += -MD
+@@ -96,7 +92,7 @@
+ 	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
+ 
+ $K/%.o: $K/%.S
+-	$(CC) -march=rv64gc -g $(DETFLAGS) -c -o $@ $<
++	$(CC) -march=rv64gc -g -c -o $@ $<
+ 
+ tags: $(OBJS)
+ 	etags kernel/*.S kernel/*.c
+@@ -130,6 +126,10 @@
+ .PRECIOUS: %.o
+ 
+ UPROGS=\
++	$U/_threadtest\
++	$U/_synctest\
++	$U/_deadlock\
++	$U/_priotest\
+ 	$U/_cat\
+ 	$U/_echo\
+ 	$U/_forktest\
+@@ -141,14 +141,8 @@
+ 	$U/_mkdir\
+ 	$U/_rm\
+ 	$U/_sh\
+-	$U/_stressfs\
+-	$U/_usertests\
+-	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-	$U/_logstress\
+-	$U/_forphan\
+-	$U/_dorphan\
+ 	$U/_sync\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+@@ -174,7 +168,7 @@
+ CPUS := 3
+ endif
+ 
+-QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
++QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp 1 -nographic
+ QEMUOPTS += -global virtio-mmio.force-legacy=false
+ QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
+ QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0

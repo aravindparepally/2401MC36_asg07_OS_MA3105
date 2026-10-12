@@ -1,0 +1,23 @@
+--- /dev/null	2026-10-13 02:45:28.510887054 +0530
++++ user/priotest.c	2026-10-06 22:57:45.817117423 +0530
+@@ -0,0 +1,20 @@
++#include "kernel/types.h"
++#include "user/user.h"
++void cpu_bound(void *arg) {
++  int id = (int)(uint64)arg;
++  int prio = get_priority(getpid());
++  printf("Process %d started with priority %d\n", id, prio);
++  for(volatile int i=0; i<100000000; i++);
++  printf("Process %d finished.\n", id);
++  exit(0);
++}
++int main() {
++  printf("=== Priority Scheduling Test (Q4) ===\n");
++  int p1 = fork(); if(p1==0) { set_priority(getpid(), 5); cpu_bound((void*)1); }
++  int p2 = fork(); if(p2==0) { set_priority(getpid(), 10); cpu_bound((void*)2); }
++  int p3 = fork(); if(p3==0) { set_priority(getpid(), 15); cpu_bound((void*)3); }
++  int p4 = fork(); if(p4==0) { set_priority(getpid(), 20); cpu_bound((void*)4); }
++  wait(0); wait(0); wait(0); wait(0);
++  printf("All processes finished.\n");
++  exit(0);
++}
